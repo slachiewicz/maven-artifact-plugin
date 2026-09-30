@@ -18,7 +18,6 @@
  */
 package org.apache.maven.plugins.artifact.buildinfo;
 
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
@@ -29,22 +28,22 @@ import java.nio.file.Path;
 import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.stream.Collectors;
 
 import org.apache.commons.codec.digest.DigestUtils;
-import org.apache.maven.RepositoryUtils;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.logging.Log;
-import org.apache.maven.project.MavenProject;
-import org.apache.maven.rtinfo.RuntimeInformation;
-import org.apache.maven.toolchain.Toolchain;
-import org.eclipse.aether.artifact.Artifact;
-import org.eclipse.aether.artifact.DefaultArtifact;
-import org.eclipse.aether.util.artifact.ArtifactIdUtils;
+import org.apache.maven.api.ProducedArtifact;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.Session;
+import org.apache.maven.api.Toolchain;
+import org.apache.maven.api.plugin.Log;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.services.ProjectManager;
 
 /**
  * Buildinfo content writer.
@@ -53,25 +52,25 @@ class BuildInfoWriter {
     private final Log log;
     private final PrintWriter p;
     private final boolean mono;
-    private final RuntimeInformation rtInformation;
-    private final Map<Artifact, String> artifacts = new LinkedHashMap<>();
+    private final Session session;
+    private final Map<OutputArtifact, String> artifacts = new LinkedHashMap<>();
     private int projectCount = -1;
     private boolean ignoreJavadoc = true;
     private List<PathMatcher> ignore;
     private Toolchain toolchain;
 
-    BuildInfoWriter(Log log, PrintWriter p, boolean mono, RuntimeInformation rtInformation) {
+    BuildInfoWriter(Log log, PrintWriter p, boolean mono, Session session) {
         this.log = log;
         this.p = p;
         this.mono = mono;
-        this.rtInformation = rtInformation;
+        this.session = session;
     }
 
-    void printHeader(MavenProject project, MavenProject aggregate, String rangeFilter, boolean reproducible) {
+    void printHeader(Project project, Project aggregate, String rangeFilter, boolean reproducible) {
         p.println("# https://reproducible-builds.org/docs/jvm/");
         p.println("buildinfo.version=1.0-SNAPSHOT");
         p.println();
-        p.println("name=" + project.getName());
+        p.println("name=" + project.getModel().getName());
         p.println("group-id=" + project.getGroupId());
         p.println("artifact-id=" + project.getArtifactId());
         p.println("version=" + project.getVersion());
@@ -100,11 +99,13 @@ class BuildInfoWriter {
         p.println();
         p.println("# Maven rebuild instructions and effective environment");
         if (!reproducible) {
-            p.println("mvn.version=" + rtInformation.getMavenVersion());
+            p.println("mvn.version=" + session.getMavenVersion());
         }
-        if ((project.getPrerequisites() != null) && (project.getPrerequisites().getMaven() != null)) {
+        if ((project.getModel().getPrerequisites() != null)
+                && (project.getModel().getPrerequisites().getMaven() != null)) {
             // TODO wrong algorithm, should reuse algorithm written in versions-maven-plugin
-            p.println("mvn.minimum.version=" + project.getPrerequisites().getMaven());
+            p.println("mvn.minimum.version="
+                    + project.getModel().getPrerequisites().getMaven());
         }
 
         if (!rangeFilter.isEmpty()) {
@@ -138,14 +139,14 @@ class BuildInfoWriter {
         return (index < 0) ? javaVersion : javaVersion.substring(0, index);
     }
 
-    private void printSourceInformation(MavenProject project) {
+    private void printSourceInformation(Project project) {
         boolean sourceAvailable = false;
         p.println("# source information");
         // p.println( "# TBD source.* artifact, url should be parameters" );
-        if (project.getScm() != null) {
+        if (project.getModel().getScm() != null) {
             sourceAvailable = true;
-            p.println("source.scm.uri=" + project.getScm().getConnection());
-            p.println("source.scm.tag=" + project.getScm().getTag());
+            p.println("source.scm.uri=" + project.getModel().getScm().getConnection());
+            p.println("source.scm.tag=" + project.getModel().getScm().getTag());
         } else {
             p.println("# no scm configured in pom.xml");
         }
@@ -155,7 +156,7 @@ class BuildInfoWriter {
         }
     }
 
-    void printArtifacts(MavenProject project) throws MojoExecutionException {
+    void printArtifacts(Project project) throws MojoException {
         String prefix = "outputs.";
         if (!mono) {
             // aggregated buildinfo output
@@ -165,86 +166,92 @@ class BuildInfoWriter {
             p.println(prefix + "coordinates=" + project.getGroupId() + ':' + project.getArtifactId());
         }
 
+        ProjectManager projectManager = session.getService(ProjectManager.class);
+        Collection<ProducedArtifact> attachedArtifacts = projectManager.getAttachedArtifacts(project);
+
         // detect Maven 4 consumer POM transient attachment
-        Artifact consumerPom = RepositoryUtils.toArtifacts(project.getAttachedArtifacts()).stream()
+        OutputArtifact consumerPom = attachedArtifacts.stream()
                 .filter(a -> "pom".equals(a.getExtension()) && "consumer".equals(a.getClassifier()))
                 .findAny()
+                .map(a -> OutputArtifact.of(a, session.getArtifactPath(a).orElse(null)))
                 .orElse(null);
 
         int n = 0;
-        Artifact pomArtifact =
-                new DefaultArtifact(project.getGroupId(), project.getArtifactId(), null, "pom", project.getVersion());
+        OutputArtifact pomArtifact = new OutputArtifact(
+                project.getGroupId(), project.getArtifactId(), project.getVersion(), "", "pom", null);
         if (consumerPom != null) {
             // Maven 4 transient consumer POM attachment is published as the POM, overrides build POM, see
             // https://github.com/apache/maven/blob/c79a7a02721f0f9fd7e202e99f60b593461ba8cc/maven-core/src/main/java/org/apache/maven/internal/transformation/ConsumerPomArtifactTransformer.java#L130-L155
             try {
                 Path pomFile = Files.createTempFile(Paths.get(project.getBuild().getDirectory()), "consumer-", ".pom");
-                Files.copy(consumerPom.getFile().toPath(), pomFile, StandardCopyOption.REPLACE_EXISTING);
-                pomArtifact = pomArtifact.setFile(pomFile.toFile());
+                Files.copy(consumerPom.file(), pomFile, StandardCopyOption.REPLACE_EXISTING);
+                pomArtifact = pomArtifact.withFile(pomFile);
             } catch (IOException e) {
                 p.println("Error processing consumer POM: " + e);
             }
         } else {
-            pomArtifact = pomArtifact.setFile(project.getFile());
+            pomArtifact = pomArtifact.withFile(project.getPomPath());
         }
 
         artifacts.put(pomArtifact, prefix + n);
         if (isIgnore(pomArtifact)) {
-            p.println("# ignored " + getArtifactFilename(pomArtifact));
+            p.println("# ignored " + pomArtifact.filename());
         } else {
             printFile(
                     prefix + n++,
-                    pomArtifact.getGroupId(),
-                    pomArtifact.getFile(),
+                    pomArtifact.groupId(),
+                    pomArtifact.file(),
                     project.getArtifactId() + '-' + project.getVersion() + ".pom");
         }
 
         if (consumerPom != null) {
             // build pom
-            Artifact buildPomArtifact = new DefaultArtifact(
-                    project.getGroupId(), project.getArtifactId(), "build", "pom", project.getVersion());
-            buildPomArtifact = buildPomArtifact.setFile(project.getFile());
+            OutputArtifact buildPomArtifact = new OutputArtifact(
+                            project.getGroupId(), project.getArtifactId(), project.getVersion(), "build", "pom", null)
+                    .withFile(project.getPomPath());
 
             if (isIgnore(buildPomArtifact)) {
-                p.println("# ignored " + getArtifactFilename(buildPomArtifact));
+                p.println("# ignored " + buildPomArtifact.filename());
             } else {
                 artifacts.put(buildPomArtifact, prefix + n);
                 printFile(
                         prefix + n++,
-                        buildPomArtifact.getGroupId(),
-                        buildPomArtifact.getFile(),
+                        buildPomArtifact.groupId(),
+                        buildPomArtifact.file(),
                         project.getArtifactId() + '-' + project.getVersion() + "-build.pom");
             }
         }
 
-        if (project.getArtifact() == null) {
-            return;
-        }
-
-        if (project.getArtifact().getFile() != null) {
-            Artifact main = RepositoryUtils.toArtifact(project.getArtifact());
-            if (isIgnore(main)) {
-                p.println("# ignored " + getArtifactFilename(main));
-            } else {
-                printArtifact(prefix, n++, RepositoryUtils.toArtifact(project.getArtifact()));
+        Optional<ProducedArtifact> mainArtifact = project.getMainArtifact();
+        if (mainArtifact.isPresent()) {
+            Optional<Path> mainFile = session.getArtifactPath(mainArtifact.get());
+            if (mainFile.isPresent()) {
+                OutputArtifact main = OutputArtifact.of(mainArtifact.get(), mainFile.get());
+                if (isIgnore(main)) {
+                    p.println("# ignored " + main.filename());
+                } else {
+                    printArtifact(prefix, n++, main);
+                }
             }
         }
 
-        for (Artifact attached : RepositoryUtils.toArtifacts(project.getAttachedArtifacts())) {
-            if ("pom".equals(attached.getExtension()) && "consumer".equals(attached.getClassifier())) {
+        for (ProducedArtifact attachedArtifact : attachedArtifacts) {
+            OutputArtifact attached = OutputArtifact.of(
+                    attachedArtifact, session.getArtifactPath(attachedArtifact).orElse(null));
+            if ("pom".equals(attached.extension()) && "consumer".equals(attached.classifier())) {
                 // ignore consumer pom
                 continue;
             }
-            if (attached.getExtension().endsWith(".asc")) {
+            if (attached.extension().endsWith(".asc")) {
                 // ignore pgp signatures
                 continue;
             }
-            if (ignoreJavadoc && "javadoc".equals(attached.getClassifier())) {
+            if (ignoreJavadoc && "javadoc".equals(attached.classifier())) {
                 // TEMPORARY ignore javadoc, waiting for MJAVADOC-627 in m-javadoc-p 3.2.0
                 continue;
             }
             if (isIgnore(attached)) {
-                p.println("# ignored " + getArtifactFilename(attached));
+                p.println("# ignored " + attached.filename());
                 artifacts.put(attached, null);
                 continue;
             }
@@ -252,64 +259,57 @@ class BuildInfoWriter {
         }
     }
 
-    private void printArtifact(String prefix, int i, Artifact artifact) throws MojoExecutionException {
+    private void printArtifact(String prefix, int i, OutputArtifact artifact) throws MojoException {
         prefix = prefix + i;
-        File artifactFile = artifact.getFile();
-        if (artifactFile.isDirectory()) {
-            if ("pom".equals(artifact.getExtension())) {
+        Path artifactFile = artifact.file();
+        if (artifactFile == null) {
+            log.warn("Ignoring artifact " + artifact.id() + " because it has no file");
+            return;
+        }
+        if (Files.isDirectory(artifactFile)) {
+            if ("pom".equals(artifact.extension())) {
                 // ignore .pom files: they should not be treated as Artifacts
                 return;
             }
             // edge case found in a distribution module with default packaging and skip set for
             // m-jar-p: should use pom packaging instead
-            throw new MojoExecutionException("Artifact " + ArtifactIdUtils.toId(artifact) + " points to a directory: "
-                    + artifactFile + ". Packaging should be 'pom'?");
+            throw new MojoException("Artifact " + artifact.id() + " points to a directory: " + artifactFile
+                    + ". Packaging should be 'pom'?");
         }
-        if (!artifactFile.isFile()) {
-            log.warn("Ignoring artifact " + ArtifactIdUtils.toId(artifact) + " because it points to inexistent "
-                    + artifactFile);
+        if (!Files.isRegularFile(artifactFile)) {
+            log.warn("Ignoring artifact " + artifact.id() + " because it points to inexistent " + artifactFile);
             return;
         }
 
-        printFile(prefix, artifact.getGroupId(), artifact.getFile(), getArtifactFilename(artifact));
+        printFile(prefix, artifact.groupId(), artifact.file(), artifact.filename());
         artifacts.put(artifact, prefix);
     }
 
-    static String getArtifactFilename(Artifact artifact) {
-        StringBuilder path = new StringBuilder(128);
-
-        path.append(artifact.getArtifactId()).append('-').append(artifact.getBaseVersion());
-
-        if (!artifact.getClassifier().isEmpty()) {
-            path.append('-').append(artifact.getClassifier());
-        }
-
-        if (!artifact.getExtension().isEmpty()) {
-            path.append('.').append(artifact.getExtension());
-        }
-
-        return path.toString();
+    static String getArtifactFilename(OutputArtifact artifact) {
+        return artifact.filename();
     }
 
-    void printFile(String prefix, String groupId, File file) throws MojoExecutionException {
-        printFile(prefix, groupId, file, file.getName());
+    void printFile(String prefix, String groupId, Path file) throws MojoException {
+        printFile(prefix, groupId, file, file.getFileName().toString());
     }
 
-    private void printFile(String prefix, String groupId, File file, String filename) throws MojoExecutionException {
+    private void printFile(String prefix, String groupId, Path file, String filename) throws MojoException {
         p.println();
         p.println(prefix + ".groupId=" + groupId);
         p.println(prefix + ".filename=" + filename);
-        p.println(prefix + ".length=" + file.length());
-        try (InputStream is = Files.newInputStream(file.toPath())) {
-            p.println(prefix + ".checksums.sha512=" + DigestUtils.sha512Hex(is));
+        try {
+            p.println(prefix + ".length=" + Files.size(file));
+            try (InputStream is = Files.newInputStream(file)) {
+                p.println(prefix + ".checksums.sha512=" + DigestUtils.sha512Hex(is));
+            }
         } catch (IOException ioe) {
-            throw new MojoExecutionException("Error processing file " + file, ioe);
+            throw new MojoException("Error processing file " + file, ioe);
         } catch (IllegalArgumentException iae) {
-            throw new MojoExecutionException("Could not get hash algorithm", iae.getCause());
+            throw new MojoException("Could not get hash algorithm", iae.getCause());
         }
     }
 
-    Map<Artifact, String> getArtifacts() {
+    Map<OutputArtifact, String> getArtifacts() {
         return artifacts;
     }
 
@@ -318,12 +318,12 @@ class BuildInfoWriter {
      *
      * @param buildinfo the build info file
      * @return output properties
-     * @throws MojoExecutionException
+     * @throws MojoException
      */
-    static Properties loadOutputProperties(File buildinfo) throws MojoExecutionException {
+    static Properties loadOutputProperties(Path buildinfo) throws MojoException {
         Properties prop = new Properties();
         if (buildinfo != null) {
-            try (InputStream is = Files.newInputStream(buildinfo.toPath())) {
+            try (InputStream is = Files.newInputStream(buildinfo)) {
                 prop.load(is);
             } catch (IOException e) {
                 // silent
@@ -350,8 +350,8 @@ class BuildInfoWriter {
         this.ignore = ignore.stream().map(i -> fs.getPathMatcher("glob:" + i)).collect(Collectors.toList());
     }
 
-    boolean isIgnore(Artifact attached) {
-        Path path = Paths.get(attached.getGroupId() + '/' + getArtifactFilename(attached));
+    boolean isIgnore(OutputArtifact attached) {
+        Path path = Paths.get(attached.groupId() + '/' + attached.filename());
         return ignore.stream().anyMatch(m -> m.matches(path));
     }
 

@@ -19,14 +19,15 @@
 package org.apache.maven.plugins.artifact.buildinfo;
 
 import java.io.BufferedWriter;
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Collections;
 import java.util.HashMap;
@@ -40,26 +41,15 @@ import java.util.jar.Manifest;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipException;
 
-import org.apache.commons.io.IOUtils;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.logging.Log;
-import org.apache.maven.rtinfo.RuntimeInformation;
-import org.eclipse.aether.AbstractForwardingRepositorySystemSession;
-import org.eclipse.aether.RepositorySystem;
-import org.eclipse.aether.RepositorySystemSession;
-import org.eclipse.aether.artifact.Artifact;
-import org.eclipse.aether.collection.CollectRequest;
-import org.eclipse.aether.collection.CollectResult;
-import org.eclipse.aether.collection.DependencyCollectionException;
-import org.eclipse.aether.graph.Dependency;
-import org.eclipse.aether.graph.DependencyNode;
-import org.eclipse.aether.repository.ArtifactRepository;
-import org.eclipse.aether.repository.LocalRepository;
-import org.eclipse.aether.repository.RemoteRepository;
-import org.eclipse.aether.repository.WorkspaceReader;
-import org.eclipse.aether.resolution.ArtifactRequest;
-import org.eclipse.aether.resolution.ArtifactResolutionException;
-import org.eclipse.aether.resolution.ArtifactResult;
+import org.apache.maven.api.Artifact;
+import org.apache.maven.api.Node;
+import org.apache.maven.api.PathScope;
+import org.apache.maven.api.RemoteRepository;
+import org.apache.maven.api.Session;
+import org.apache.maven.api.plugin.Log;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.services.Transport;
+import org.apache.maven.api.services.TransportProvider;
 
 /**
  * Utility to download reference artifacts and download or generate reference buildinfo.
@@ -81,90 +71,85 @@ class ReferenceBuildinfoUtil {
     /**
      * Directory of the downloaded reference files.
      */
-    private final File referenceDir;
+    private final Path referenceDir;
 
-    private final Map<Artifact, String> artifacts;
+    private final Map<OutputArtifact, String> artifacts;
 
-    private final RepositorySystem repoSystem;
+    private final Session session;
 
-    private final RepositorySystemSession repoSession;
-
-    private final RuntimeInformation rtInformation;
-
-    ReferenceBuildinfoUtil(
-            Log log,
-            File referenceDir,
-            Map<Artifact, String> artifacts,
-            RepositorySystem repoSystem,
-            RepositorySystemSession repoSession,
-            RuntimeInformation rtInformation) {
+    ReferenceBuildinfoUtil(Log log, Path referenceDir, Map<OutputArtifact, String> artifacts, Session session) {
         this.log = log;
         this.referenceDir = referenceDir;
         this.artifacts = artifacts;
-        this.repoSystem = repoSystem;
-        this.repoSession = repoSession;
-        this.rtInformation = rtInformation;
+        this.session = session;
     }
 
-    File createReferenceBuildinfo(
-            RemoteRepository repo,
-            File buildinfoFile,
-            boolean mono,
-            RepositorySystemSession repoSession,
-            List<RemoteRepository> remoteRepos)
-            throws MojoExecutionException {
+    /**
+     * A reference file.
+     *
+     * @param file the local copy
+     * @param installed whether it comes from a previous installation in the local repository, and not from the
+     *            reference repository
+     */
+    private record Reference(Path file, boolean installed) {}
+
+    Path createReferenceBuildinfo(
+            RemoteRepository repo, Path buildinfoFile, boolean mono, List<RemoteRepository> remoteRepos)
+            throws MojoException {
         // download reference artifacts and guess Java version and OS
         String javaVersion = null;
         String osName = null;
         String currentJavaVersion = null;
         String currentOsName = null;
-        Map<Artifact, File> referenceArtifacts = new HashMap<>();
+        Map<OutputArtifact, Path> referenceArtifacts = new HashMap<>();
         int localInstallArtifacts = 0;
-        for (Artifact artifact : artifacts.keySet()) {
-            try {
-                // download
-                ArtifactResult referenceResult = downloadReference(repo, artifact);
-                File file = referenceResult.getArtifact().getFile();
-                referenceArtifacts.put(artifact, file);
-
-                if (referenceResult.getRepository() instanceof LocalRepository) {
-                    localInstallArtifacts++;
-                }
-
-                // guess Java version and OS
-                if ((javaVersion == null) && JAR_EXTENSIONS.contains(artifact.getExtension())) {
-                    ReproducibleEnv env = extractEnv(file, artifact);
-                    if ((env != null) && (env.javaVersion != null)) {
-                        javaVersion = env.javaVersion;
-                        osName = env.osName;
-
-                        ReproducibleEnv currentEnv = extractEnv(artifact.getFile(), artifact);
-                        currentJavaVersion = currentEnv.javaVersion;
-                        currentOsName = currentEnv.osName;
-                    }
-                }
-            } catch (ArtifactResolutionException e) {
+        for (OutputArtifact artifact : artifacts.keySet()) {
+            // download
+            Reference referenceResult = downloadReference(repo, artifact);
+            if (referenceResult == null) {
                 log.warn("Reference artifact not found " + artifact);
+                continue;
+            }
+            Path file = referenceResult.file();
+            referenceArtifacts.put(artifact, file);
+
+            if (referenceResult.installed()) {
+                localInstallArtifacts++;
+            }
+
+            // guess Java version and OS
+            if ((javaVersion == null) && JAR_EXTENSIONS.contains(artifact.extension())) {
+                ReproducibleEnv env = extractEnv(file, artifact);
+                if ((env != null) && (env.javaVersion != null)) {
+                    javaVersion = env.javaVersion;
+                    osName = env.osName;
+
+                    ReproducibleEnv currentEnv = extractEnv(artifact.file(), artifact);
+                    currentJavaVersion = currentEnv.javaVersion;
+                    currentOsName = currentEnv.osName;
+                }
             }
         }
 
         if (localInstallArtifacts == 0) {
-            log.info("Comparing against " + artifacts.size() + " reference files from " + repo);
+            log.info("Comparing against " + artifacts.size() + " reference files from " + repo.getId() + " ("
+                    + repo.getUrl() + ")");
         } else if (localInstallArtifacts == artifacts.size()) {
             log.info("Comparing against " + artifacts.size() + " reference files from previous 'mvn install'");
         } else {
             log.warn("Comparing against " + localInstallArtifacts
                     + " reference files mixed from previous 'mvn install' and "
-                    + (artifacts.size() - localInstallArtifacts) + " from " + repo);
+                    + (artifacts.size() - localInstallArtifacts) + " from " + repo.getId() + " (" + repo.getUrl()
+                    + ")");
         }
 
-        File referenceBuildinfo = null;
+        Path referenceBuildinfo = null;
         try {
             // generate buildinfo from reference artifacts
-            referenceBuildinfo = getReference(null, buildinfoFile);
-            try (PrintWriter p = new PrintWriter(new BufferedWriter(new OutputStreamWriter(
-                    Files.newOutputStream(referenceBuildinfo.toPath()), StandardCharsets.UTF_8)))) {
-                BuildInfoWriter bi = new BuildInfoWriter(log, p, mono, rtInformation);
+            referenceBuildinfo = referenceDir.resolve(buildinfoFile.getFileName());
+            try (PrintWriter p = new PrintWriter(new BufferedWriter(
+                    new OutputStreamWriter(Files.newOutputStream(referenceBuildinfo), StandardCharsets.UTF_8)))) {
+                BuildInfoWriter bi = new BuildInfoWriter(log, p, mono, session);
 
                 if (javaVersion != null || osName != null) {
                     p.println("# effective build environment information");
@@ -196,90 +181,95 @@ class ReferenceBuildinfoUtil {
                     }
                 }
 
-                for (Map.Entry<Artifact, String> entry : artifacts.entrySet()) {
-                    Artifact artifact = entry.getKey();
+                for (Map.Entry<OutputArtifact, String> entry : artifacts.entrySet()) {
+                    OutputArtifact artifact = entry.getKey();
 
-                    if ("pom".equals(artifact.getExtension()) && "".equals(artifact.getClassifier())) {
-                        checkArtifactDependenciesForLocalResolution(repoSession, remoteRepos, artifact);
+                    if ("pom".equals(artifact.extension()) && "".equals(artifact.classifier())) {
+                        checkArtifactDependenciesForLocalResolution(remoteRepos, artifact);
                     }
 
-                    File referenceFile = referenceArtifacts.get(artifact);
+                    Path referenceFile = referenceArtifacts.get(artifact);
                     if (referenceFile != null) {
                         String prefix = entry.getValue();
-                        bi.printFile(prefix, artifact.getGroupId(), referenceFile);
+                        bi.printFile(prefix, artifact.groupId(), referenceFile);
                     }
                 }
 
                 if (p.checkError()) {
-                    throw new MojoExecutionException("Write error to " + referenceBuildinfo);
+                    throw new MojoException("Write error to " + referenceBuildinfo);
                 }
 
                 log.debug("Minimal buildinfo generated from downloaded artifacts: " + referenceBuildinfo);
             }
         } catch (IOException e) {
-            throw new MojoExecutionException("Error creating file " + referenceBuildinfo, e);
+            throw new MojoException("Error creating file " + referenceBuildinfo, e);
         }
 
         return referenceBuildinfo;
     }
 
+    private Artifact toApiArtifact(OutputArtifact artifact) {
+        return session.createArtifact(
+                artifact.groupId(),
+                artifact.artifactId(),
+                artifact.version(),
+                artifact.classifier(),
+                artifact.extension(),
+                null);
+    }
+
     public void checkArtifactDependenciesForLocalResolution(
-            RepositorySystemSession repoSession, List<RemoteRepository> remoteRepos, Artifact artifact) {
+            List<RemoteRepository> remoteRepos, OutputArtifact artifact) {
 
         try {
-            CollectRequest collectRequest = new CollectRequest(new Dependency(artifact, null), null);
-            CollectResult collectResult = repoSystem.collectDependencies(repoSession, collectRequest);
+            // the POM is the root dependency: its dependencies are the children of the root node
+            Node root = session.collectDependencies(
+                    session.createDependencyCoordinates(session.createArtifactCoordinates(
+                            artifact.groupId(), artifact.artifactId(), artifact.version(), artifact.extension())),
+                    PathScope.MAIN_RUNTIME);
 
-            for (DependencyNode child : collectResult.getRoot().getChildren()) {
-                checkDependencyNodeTreeForLocalResolution(repoSession, child, remoteRepos);
+            for (Node child : root.getChildren()) {
+                checkDependencyNodeTreeForLocalResolution(child, remoteRepos);
             }
 
-        } catch (ArtifactResolutionException | DependencyCollectionException e) {
+        } catch (RuntimeException e) {
             log.warn("Checking for potential local artifact resolution not possible " + e);
         }
     }
 
-    private void checkDependencyNodeTreeForLocalResolution(
-            RepositorySystemSession repoSession, DependencyNode child, List<RemoteRepository> remoteRepos)
-            throws ArtifactResolutionException {
+    private void checkDependencyNodeTreeForLocalResolution(Node child, List<RemoteRepository> remoteRepos) {
         // check for every dependency in the dependency tree
         if (child.getChildren().isEmpty()) {
-            checkArtifactForLocalResolution(repoSession, child.getDependency().getArtifact(), remoteRepos);
+            checkArtifactForLocalResolution(child.getArtifact(), remoteRepos);
         } else {
-            for (DependencyNode node : child.getChildren()) {
-                checkDependencyNodeTreeForLocalResolution(repoSession, node, remoteRepos);
+            for (Node node : child.getChildren()) {
+                checkDependencyNodeTreeForLocalResolution(node, remoteRepos);
             }
         }
     }
 
     /* An artifact stemming from a local repo is most likely an issue during release builds. See #146. */
-    private void checkArtifactForLocalResolution(
-            RepositorySystemSession repoSession, Artifact artifact, List<RemoteRepository> remoteRepos)
-            throws ArtifactResolutionException {
-        ArtifactRequest artifactRequest = new ArtifactRequest();
-        artifactRequest.setArtifact(artifact);
-        artifactRequest.setRepositories(remoteRepos);
-        ArtifactResult artifactResult = repoSystem.resolveArtifact(repoSession, artifactRequest);
-        Artifact resolvedArtifact = artifactResult.getArtifact();
-        ArtifactRepository resultRepo = artifactResult.getRepository();
+    private void checkArtifactForLocalResolution(Artifact artifact, List<RemoteRepository> remoteRepos) {
+        Path resolved = session.resolveArtifact(artifact, remoteRepos).getPath();
 
-        if (resultRepo instanceof LocalRepository) {
+        if (resolved.startsWith(session.getLocalRepository().getPath())
+                && LocalRepositoryOrigin.isInstalledLocally(resolved)) {
             log.warn(String.format(
                     "The dependency %s:%s:%s is stemming from a local install to your local Maven repository. "
                             + "Please ensure that this is intended. "
                             + "If not, consider removing this artifact and rebuilding, "
                             + "or that your locally installed artifact from %s matches public reference from remote.",
-                    resolvedArtifact.getGroupId(),
-                    resolvedArtifact.getArtifactId(),
-                    resolvedArtifact.getVersion(),
+                    artifact.getGroupId(),
+                    artifact.getArtifactId(),
+                    artifact.getVersion(),
                     // if the artifact was resolved successfully, there is a file we can access
-                    resolvedArtifact.getFile().getAbsolutePath()));
+                    resolved.toAbsolutePath()));
         }
     }
 
-    private ReproducibleEnv extractEnv(File file, Artifact artifact) {
+    private ReproducibleEnv extractEnv(Path file, OutputArtifact artifact) {
         log.debug("Guessing java.version and os.name from jar " + file);
-        try (JarFile jar = new JarFile(file)) {
+        try (JarFile jar = new JarFile(file.toFile())) {
             Manifest manifest = jar.getManifest();
             if (manifest != null) {
                 String javaVersion = extractJavaVersion(manifest);
@@ -313,14 +303,14 @@ class ReferenceBuildinfoUtil {
         return null;
     }
 
-    private String extractOsName(Artifact a, JarFile jar) {
-        String entryName = "META-INF/maven/" + a.getGroupId() + '/' + a.getArtifactId() + "/pom.properties";
+    private String extractOsName(OutputArtifact a, JarFile jar) {
+        String entryName = "META-INF/maven/" + a.groupId() + '/' + a.artifactId() + "/pom.properties";
         ZipEntry zipEntry = jar.getEntry(entryName);
         if (zipEntry == null) {
             return null;
         }
         try (InputStream in = jar.getInputStream(zipEntry)) {
-            String content = IOUtils.toString(in, StandardCharsets.UTF_8);
+            String content = new String(in.readAllBytes(), StandardCharsets.UTF_8);
             log.debug("Manifest content: " + content);
             if (content.contains("\r\n")) {
                 return "Windows (from pom.properties newline)";
@@ -333,66 +323,42 @@ class ReferenceBuildinfoUtil {
         return null;
     }
 
-    private ArtifactResult downloadReference(RemoteRepository repo, Artifact artifact)
-            throws MojoExecutionException, ArtifactResolutionException {
+    /**
+     * Gets the reference of an artifact: the file of a previous installation in the local repository, else the one of
+     * the reference repository, downloaded without looking at the files of the current build.
+     *
+     * @return the reference, or {@code null} if the reference repository does not have the artifact
+     */
+    private Reference downloadReference(RemoteRepository repo, OutputArtifact artifact) throws MojoException {
         try {
-            ArtifactRequest request = new ArtifactRequest();
-            request.setArtifact(artifact);
-            request.setRepositories(Collections.singletonList(repo));
+            Artifact apiArtifact = toApiArtifact(artifact);
+            Path destFile = getReference(artifact.groupId(), artifact.filename());
 
-            ArtifactResult result =
-                    repoSystem.resolveArtifact(new NoWorkspaceRepositorySystemSession(repoSession), request);
-            File resultFile = result.getArtifact().getFile();
-            File destFile = getReference(artifact.getGroupId(), resultFile);
-
-            Files.copy(
-                    resultFile.toPath(),
-                    destFile.toPath(),
-                    LinkOption.NOFOLLOW_LINKS,
-                    StandardCopyOption.REPLACE_EXISTING);
-
-            result.getArtifact().setFile(destFile);
-
-            return result;
-        } catch (ArtifactResolutionException are) {
-            if (are.getResult().isMissing()) {
-                throw are;
+            Path local = session.getPathForLocalArtifact(apiArtifact);
+            if (Files.isRegularFile(local)) {
+                boolean installed = LocalRepositoryOrigin.isInstalledLocally(local, repo.getId());
+                Files.copy(local, destFile, LinkOption.NOFOLLOW_LINKS, StandardCopyOption.REPLACE_EXISTING);
+                return new Reference(destFile, installed);
             }
-            throw new MojoExecutionException("Error resolving reference artifact " + artifact, are);
-        } catch (IOException ioe) {
-            throw new MojoExecutionException("Error copying reference artifact " + artifact, ioe);
+
+            Path path = session.getPathForRemoteArtifact(repo, apiArtifact);
+            URI uri = URI.create(path.toString().replace('\\', '/'));
+            try (Transport transport =
+                    session.getService(TransportProvider.class).transport(session, repo)) {
+                if (!transport.get(uri, destFile)) {
+                    return null;
+                }
+            }
+            return new Reference(destFile, false);
+        } catch (IOException | RuntimeException e) {
+            throw new MojoException("Error resolving reference artifact " + artifact, e);
         }
     }
 
-    private File getReference(String groupId, File file) throws IOException {
-        File dir;
-        if (groupId == null) {
-            dir = referenceDir;
-        } else {
-            dir = new File(referenceDir, groupId);
-            if (!dir.isDirectory()) {
-                Files.createDirectories(dir.toPath());
-            }
-        }
-        return new File(dir, file.getName());
-    }
-
-    private static class NoWorkspaceRepositorySystemSession extends AbstractForwardingRepositorySystemSession {
-        private final RepositorySystemSession rss;
-
-        NoWorkspaceRepositorySystemSession(RepositorySystemSession rss) {
-            this.rss = rss;
-        }
-
-        @Override
-        protected RepositorySystemSession getSession() {
-            return rss;
-        }
-
-        @Override
-        public WorkspaceReader getWorkspaceReader() {
-            return null;
-        }
+    private Path getReference(String groupId, String filename) throws IOException {
+        Path dir = referenceDir.resolve(groupId);
+        Files.createDirectories(dir);
+        return dir.resolve(filename);
     }
 
     private static class ReproducibleEnv {

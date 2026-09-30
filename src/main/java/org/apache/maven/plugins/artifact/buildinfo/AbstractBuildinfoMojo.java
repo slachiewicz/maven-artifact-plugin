@@ -19,7 +19,6 @@
 package org.apache.maven.plugins.artifact.buildinfo;
 
 import java.io.BufferedWriter;
-import java.io.File;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
@@ -38,30 +37,30 @@ import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import org.apache.maven.archiver.MavenArchiver;
-import org.apache.maven.execution.MavenSession;
-import org.apache.maven.plugin.AbstractMojo;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugin.logging.Log;
-import org.apache.maven.plugins.annotations.Parameter;
-import org.apache.maven.project.MavenProject;
-import org.apache.maven.rtinfo.RuntimeInformation;
-import org.apache.maven.toolchain.Toolchain;
-import org.apache.maven.toolchain.ToolchainManager;
-import org.eclipse.aether.artifact.Artifact;
-import org.eclipse.aether.graph.Dependency;
-import org.eclipse.aether.graph.DependencyNode;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.Session;
+import org.apache.maven.api.Toolchain;
+import org.apache.maven.api.di.Inject;
+import org.apache.maven.api.model.Model;
+import org.apache.maven.api.plugin.Log;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Parameter;
+import org.apache.maven.api.services.ProjectManager;
+import org.apache.maven.api.services.ToolchainManager;
+import org.apache.maven.api.services.xml.ModelXmlFactory;
+import org.apache.maven.plugins.artifact.buildinfo.RangesUtil.RangeDependency;
+import org.apache.maven.shared.archiver.MavenArchiver;
 
 /**
  * Base buildinfo-generating class, for goals related to Reproducible Builds {@code .buildinfo} files.
  *
  * @since 3.2.0
  */
-public abstract class AbstractBuildinfoMojo extends AbstractMojo {
+public abstract class AbstractBuildinfoMojo implements org.apache.maven.api.plugin.Mojo {
 
     /**
      * Location of the generated buildinfo file.
@@ -70,7 +69,7 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
             defaultValue = "${project.build.directory}/${project.artifactId}-${project.version}.buildinfo",
             required = true,
             readonly = true)
-    protected File buildinfoFile;
+    protected Path buildinfoFile;
 
     /**
      * Ignore javadoc attached artifacts from buildinfo generation.
@@ -132,72 +131,91 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
     private boolean diagnose;
 
     /**
-     * To obtain a toolchain if possible.
-     */
-    private final ToolchainManager toolchainManager;
-
-    protected final RuntimeInformation rtInformation;
-
-    private final RangesUtil rangesUtil;
-
-    /**
      * The Maven project.
      */
-    protected final MavenProject project;
+    @Inject
+    protected Project project;
 
     /**
      * The current build session instance. This is used for toolchain manager API calls.
      */
-    protected final MavenSession session;
+    @Inject
+    protected Session session;
 
-    protected AbstractBuildinfoMojo(
-            ToolchainManager toolchainManager,
-            RuntimeInformation rtInformation,
-            RangesUtil rangesUtil,
-            MavenProject project,
-            MavenSession session) {
-        this.toolchainManager = toolchainManager;
-        this.rtInformation = rtInformation;
-        this.project = project;
-        this.session = session;
-        this.rangesUtil = rangesUtil;
-    }
+    @Inject
+    protected Log log;
 
     @Override
-    public void execute() throws MojoExecutionException {
+    public void execute() throws MojoException {
         boolean mono = session.getProjects().size() == 1;
 
-        hasBadOutputTimestamp(outputTimestamp, getLog(), project, session, diagnose);
+        hasBadOutputTimestamp(outputTimestamp, log, project, session, diagnose);
 
         if (!mono) {
             // if module skips install and/or deploy
-            if (detectSkip && PluginUtil.isSkip(project)) {
-                getLog().info("Auto-skipping goal because module skips install and/or deploy");
+            if (detectSkip && PluginUtil.isSkip(session, project)) {
+                log.info("Auto-skipping goal because module skips install and/or deploy");
                 return;
             }
             if (isSkipModule(project)) {
-                getLog().info("Skipping goal for module");
+                log.info("Skipping goal for module");
                 return;
             }
             // if multi-module build, generate (aggregate) buildinfo only in last module
-            MavenProject last = getLastProject();
-            if (project != last) {
+            Project last = getLastProject();
+            if (!isSame(project, last)) {
                 skip(last);
                 return;
             }
         }
 
         // generate buildinfo
-        Map<Artifact, String> artifacts = generateBuildinfo(mono);
-        getLog().info("Saved " + (mono ? "" : "aggregate ") + "info on build to " + buildinfoFile);
+        Map<OutputArtifact, String> artifacts = generateBuildinfo(mono);
+        log.info("Saved " + (mono ? "" : "aggregate ") + "info on build to " + buildinfoFile);
 
         copyAggregateToRoot(buildinfoFile);
 
         execute(artifacts);
     }
 
+    /**
+     * @return whether two projects are the same project of the build
+     */
+    static boolean isSame(Project a, Project b) {
+        return a == b || (a != null && b != null && a.getId().equals(b.getId()));
+    }
+
+    /**
+     * @return whether the project is one of the build
+     */
+    static boolean isInReactor(Session session, Project project) {
+        return project != null && session.getProjects().stream().anyMatch(p -> isSame(p, project));
+    }
+
+    /**
+     * @return the project the build was started from
+     */
+    static Project getTopLevelProject(Session session) {
+        return session.getProjects().stream()
+                .filter(Project::isTopProject)
+                .findFirst()
+                .orElseGet(() -> session.getProjects().get(0));
+    }
+
+    /**
+     * @return the property of the model read from the POM file, without inheritance nor interpolation
+     */
+    private static String originalProperty(Session session, Project project, String name) {
+        try {
+            Model original = session.getService(ModelXmlFactory.class).read(project.getPomPath());
+            return original.getProperties().get(name);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     static boolean hasBadOutputTimestamp(
-            String outputTimestamp, Log log, MavenProject project, MavenSession session, boolean diagnose) {
+            String outputTimestamp, Log log, Project project, Session session, boolean diagnose) {
         Instant timestamp =
                 MavenArchiver.parseBuildOutputTimestamp(outputTimestamp).orElse(null);
         String effective = ((timestamp == null) ? "disabled" : DateTimeFormatter.ISO_INSTANT.format(timestamp));
@@ -206,15 +224,17 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
             diagnose(outputTimestamp, log, project, session, effective);
         }
 
+        Map<String, String> properties =
+                session.getService(ProjectManager.class).getProperties(project);
         if (timestamp == null) {
             log.error("Reproducible Build not activated by project.build.outputTimestamp property: "
                     + "see https://maven.apache.org/guides/mini/guide-reproducible-builds.html");
 
-            String projectProperty = project.getProperties().getProperty("project.build.outputTimestamp");
+            String projectProperty = properties.get("project.build.outputTimestamp");
             if (projectProperty != null && projectProperty.startsWith("${git.")) {
                 log.error("project.build.outputTimestamp = \"" + projectProperty + "\": isn't Git value set?");
                 log.error("Did validate phase run and Git plugin set the value?");
-                if (project.getPackaging().equals("pom")) {
+                if (project.getPackaging().id().equals("pom")) {
                     log.error("if using git-commit-id-plugin, <skipPoms>false</skipPoms> may solve the issue.");
                 }
             }
@@ -228,37 +248,36 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
 
         // check if timestamp defined in a project from reactor: info if it is not the case
         boolean parentInReactor = false;
-        MavenProject reactorParent = project;
-        while (session.getProjects().contains(reactorParent.getParent())) {
+        Project reactorParent = project;
+        while (isInReactor(session, reactorParent.getParent().orElse(null))) {
             parentInReactor = true;
-            reactorParent = reactorParent.getParent();
+            reactorParent = reactorParent.getParent().get();
         }
-        String prop = reactorParent.getOriginalModel().getProperties().getProperty("project.build.outputTimestamp");
+        String prop = originalProperty(session, reactorParent, "project.build.outputTimestamp");
         if (prop == null) {
             log.info("<project.build.outputTimestamp> property (= " + outputTimestamp + ") is inherited"
                     + (parentInReactor ? " from outside the reactor" : "") + ", you can override in "
-                    + (parentInReactor ? "parent POM from reactor " + reactorParent.getFile() : "pom.xml"));
+                    + (parentInReactor ? "parent POM from reactor " + reactorParent.getPomPath() : "pom.xml"));
             return false;
         }
 
         return false;
     }
 
-    static void diagnose(
-            String outputTimestamp, Log log, MavenProject project, MavenSession session, String effective) {
+    static void diagnose(String outputTimestamp, Log log, Project project, Session session, String effective) {
+        ProjectManager projectManager = session.getService(ProjectManager.class);
         if (session.getProjects().size() > 1) {
-            MavenProject root = session.getTopLevelProject();
-            MavenProject first = session.getProjects().get(0);
-            Path firstRelative =
-                    root.getBasedir().toPath().relativize(first.getFile().toPath());
-            MavenProject firstParent = first.getParent();
-            log.info("reactor executionRoot = " + root.getId() + (root.equals(project) ? " (current)" : "")
+            Project root = getTopLevelProject(session);
+            Project first = session.getProjects().get(0);
+            Path firstRelative = root.getBasedir().relativize(first.getPomPath());
+            Project firstParent = first.getParent().orElse(null);
+            log.info("reactor executionRoot = " + root.getId() + (isSame(root, project) ? " (current)" : "")
                     + System.lineSeparator()
                     + "       reactor first = "
-                    + (first.equals(root) ? "executionRoot" : (first.getId() + " @ " + firstRelative))
+                    + (isSame(first, root) ? "executionRoot" : (first.getId() + " @ " + firstRelative))
                     + System.lineSeparator()
-                    + "               first.parent = " + ((firstParent == null) ? firstParent : firstParent.getId()));
-            if (firstParent != null && session.getProjects().contains(firstParent)) {
+                    + "               first.parent = " + ((firstParent == null) ? null : firstParent.getId()));
+            if (firstParent != null && isInReactor(session, firstParent)) {
                 // should not happen...
                 log.warn("reactor first parent = " + firstParent.getId() + " is in reactor");
             }
@@ -267,10 +286,9 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
         log.info("outputTimestamp = " + outputTimestamp
                 + (effective.equals(outputTimestamp) ? "" : (" => " + effective)));
 
-        String projectProperty = project.getProperties().getProperty("project.build.outputTimestamp");
-        String modelProperty = project.getModel().getProperties().getProperty("project.build.outputTimestamp");
-        String originalModelProperty =
-                project.getOriginalModel().getProperties().getProperty("project.build.outputTimestamp");
+        String projectProperty = projectManager.getProperties(project).get("project.build.outputTimestamp");
+        String modelProperty = project.getModel().getProperties().get("project.build.outputTimestamp");
+        String originalModelProperty = originalProperty(session, project, "project.build.outputTimestamp");
 
         log.info("plugin outputTimestamp parameter diagnostics:" + System.lineSeparator()
                 + "        - plugin outputTimestamp parameter (defaultValue=\"${project.build.outputTimestamp}\") = "
@@ -286,19 +304,20 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
             return;
         }
 
-        MavenProject parent = project.getParent();
-        if (parent != null) {
+        Optional<Project> parent = project.getParent();
+        if (parent.isPresent()) {
             StringBuilder sb = new StringBuilder("Inheritance analysis for property:" + System.lineSeparator()
                     + "        - current " + project.getId() + " property = " + projectProperty);
-            while (parent != null) {
-                String parentProperty = parent.getProperties().getProperty("project.build.outputTimestamp");
+            while (parent.isPresent()) {
+                String parentProperty =
+                        projectManager.getProperties(parent.get()).get("project.build.outputTimestamp");
                 sb.append(System.lineSeparator());
-                sb.append("        - " + (session.getProjects().contains(parent) ? "reactor" : "external") + " parent "
-                        + parent.getId() + " property = " + parentProperty);
+                sb.append("        - " + (isInReactor(session, parent.get()) ? "reactor" : "external") + " parent "
+                        + parent.get().getId() + " property = " + parentProperty);
                 if (!projectProperty.equals(parentProperty)) {
                     break;
                 }
-                parent = parent.getParent();
+                parent = parent.get().getParent();
             }
             log.info(sb.toString());
         }
@@ -310,39 +329,36 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
      * @param artifacts a Map of artifacts added to the build info with their associated property key prefix
      *         (<code>outputs.[#module.].#artifact</code>)
      */
-    abstract void execute(Map<Artifact, String> artifacts) throws MojoExecutionException;
+    abstract void execute(Map<OutputArtifact, String> artifacts) throws MojoException;
 
-    protected void skip(MavenProject last) throws MojoExecutionException {
-        getLog().info("Skipping intermediate goal run, aggregate will be " + last.getArtifactId());
+    protected void skip(Project last) throws MojoException {
+        log.info("Skipping intermediate goal run, aggregate will be " + last.getArtifactId());
     }
 
-    protected File copyAggregateToRoot(File aggregate) throws MojoExecutionException {
+    protected Path copyAggregateToRoot(Path aggregate) throws MojoException {
         if (session.getProjects().size() == 1) {
             // mono-module, no aggregate file to deal with
             return aggregate;
         }
 
         // copy aggregate file to root target directory
-        MavenProject root = session.getTopLevelProject();
-        String extension = aggregate.getName().substring(aggregate.getName().lastIndexOf('.'));
-        File rootCopy =
-                new File(root.getBuild().getDirectory(), root.getArtifactId() + '-' + root.getVersion() + extension);
+        Project root = getTopLevelProject(session);
+        String name = aggregate.getFileName().toString();
+        String extension = name.substring(name.lastIndexOf('.'));
+        Path rootCopy = Paths.get(root.getBuild().getDirectory())
+                .resolve(root.getArtifactId() + '-' + root.getVersion() + extension);
         try {
-            rootCopy.getParentFile().mkdirs();
-            Files.copy(
-                    aggregate.toPath(),
-                    rootCopy.toPath(),
-                    LinkOption.NOFOLLOW_LINKS,
-                    StandardCopyOption.REPLACE_EXISTING);
-            getLog().info("Aggregate " + extension.substring(1) + " copied to " + relative(rootCopy));
+            Files.createDirectories(rootCopy.getParent());
+            Files.copy(aggregate, rootCopy, LinkOption.NOFOLLOW_LINKS, StandardCopyOption.REPLACE_EXISTING);
+            log.info("Aggregate " + extension.substring(1) + " copied to " + relative(rootCopy));
         } catch (IOException ioe) {
-            throw new MojoExecutionException("Could not copy " + aggregate + " to " + rootCopy, ioe);
+            throw new MojoException("Could not copy " + aggregate + " to " + rootCopy, ioe);
         }
         return rootCopy;
     }
 
     protected BuildInfoWriter newBuildInfoWriter(PrintWriter p, boolean mono) {
-        BuildInfoWriter bi = new BuildInfoWriter(getLog(), p, mono, rtInformation);
+        BuildInfoWriter bi = new BuildInfoWriter(log, p, mono, session);
         bi.setIgnoreJavadoc(ignoreJavadoc);
         bi.setIgnore(ignore);
         bi.setToolchain(getToolchain());
@@ -356,37 +372,41 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
      * @param mono is it a mono-module build?
      * @return a Map of artifacts added to the build info with their associated property key prefix
      *         (<code>outputs.[#module.].#artifact</code>)
-     * @throws MojoExecutionException if anything goes wrong
+     * @throws MojoException if anything goes wrong
      */
-    protected Map<Artifact, String> generateBuildinfo(boolean mono) throws MojoExecutionException {
-        MavenProject root = mono ? project : session.getTopLevelProject();
+    protected Map<OutputArtifact, String> generateBuildinfo(boolean mono) throws MojoException {
+        Project root = mono ? project : getTopLevelProject(session);
 
-        buildinfoFile.getParentFile().mkdirs();
+        try {
+            Files.createDirectories(buildinfoFile.toAbsolutePath().getParent());
+        } catch (IOException e) {
+            throw new MojoException("Error creating directory of " + buildinfoFile, e);
+        }
 
-        List<MavenProject> mavenProjects = getProjectListForBuildInfo(mono);
+        List<Project> mavenProjects = getProjectListForBuildInfo(mono);
         String rangeFilter = getVersionRangeDependenciesFilters(mavenProjects);
 
         try (PrintWriter p = new PrintWriter(new BufferedWriter(
-                new OutputStreamWriter(Files.newOutputStream(buildinfoFile.toPath()), StandardCharsets.UTF_8)))) {
+                new OutputStreamWriter(Files.newOutputStream(buildinfoFile), StandardCharsets.UTF_8)))) {
             BuildInfoWriter bi = newBuildInfoWriter(p, mono);
             bi.printHeader(root, mono ? null : project, rangeFilter, reproducible);
 
             // artifact(s) fingerprints
-            for (MavenProject project : mavenProjects) {
+            for (Project project : mavenProjects) {
                 bi.printArtifacts(project);
             }
 
             if (p.checkError()) {
-                throw new MojoExecutionException("Write error to " + buildinfoFile);
+                throw new MojoException("Write error to " + buildinfoFile);
             }
 
             return bi.getArtifacts();
         } catch (IOException e) {
-            throw new MojoExecutionException("Error creating file " + buildinfoFile, e);
+            throw new MojoException("Error creating file " + buildinfoFile, e);
         }
     }
 
-    private List<MavenProject> getProjectListForBuildInfo(boolean mono) {
+    private List<Project> getProjectListForBuildInfo(boolean mono) {
         if (mono) {
             return Collections.singletonList(project);
         } else {
@@ -394,27 +414,23 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
         }
     }
 
-    private String getVersionRangeDependenciesFilters(List<MavenProject> mavenProjects) throws MojoExecutionException {
+    private String getVersionRangeDependenciesFilters(List<Project> mavenProjects) throws MojoException {
 
-        Set<DependencyNode> dependencyNodeSet = new LinkedHashSet<>();
-        for (MavenProject project : mavenProjects) {
-            dependencyNodeSet.addAll(
-                    rangesUtil.findVersionRangeDependencies(session, project).keySet());
+        Set<String> filters = new LinkedHashSet<>();
+        for (Project project : mavenProjects) {
+            for (RangeDependency dependency : RangesUtil.findVersionRangeDependencies(session, project)) {
+                filters.add(String.format(
+                        "e(%s:%s:(%s,))", dependency.groupId(), dependency.artifactId(), dependency.version()));
+            }
         }
 
-        return dependencyNodeSet.stream()
-                .map(DependencyNode::getDependency)
-                .filter(Objects::nonNull)
-                .map(Dependency::getArtifact)
-                .filter(Objects::nonNull)
-                .map(a -> String.format("e(%s:%s:(%s,))", a.getGroupId(), a.getArtifactId(), a.getVersion()))
-                .collect(Collectors.joining(";"));
+        return String.join(";", filters);
     }
 
-    protected MavenProject getLastProject() {
+    protected Project getLastProject() {
         int i = session.getProjects().size();
         while (i > 0) {
-            MavenProject project = session.getProjects().get(--i);
+            Project project = session.getProjects().get(--i);
             if (!isSkip(project)) {
                 return project;
             }
@@ -422,11 +438,11 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
         return null;
     }
 
-    protected boolean isSkip(MavenProject project) {
-        return isSkipModule(project) || (detectSkip && PluginUtil.isSkip(project));
+    protected boolean isSkip(Project project) {
+        return isSkipModule(project) || (detectSkip && PluginUtil.isSkip(session, project));
     }
 
-    protected boolean isSkipModule(MavenProject project) {
+    protected boolean isSkipModule(Project project) {
         if (skipModules == null || skipModules.isEmpty()) {
             return false;
         }
@@ -441,18 +457,13 @@ public abstract class AbstractBuildinfoMojo extends AbstractMojo {
     }
 
     private Toolchain getToolchain() {
-        Toolchain tc = null;
-        if (toolchainManager != null) {
-            tc = toolchainManager.getToolchainFromBuildContext("jdk", session);
-        }
-
-        return tc;
+        return session.getService(ToolchainManager.class)
+                .getToolchainFromBuildContext(session, "jdk")
+                .orElse(null);
     }
 
-    protected String relative(File file) {
-        File basedir = session.getTopLevelProject().getBasedir();
-        int length = basedir.getPath().length();
-        String path = file.getPath();
-        return path.substring(length + 1);
+    protected String relative(Path file) {
+        Path basedir = getTopLevelProject(session).getBasedir();
+        return basedir.relativize(file.toAbsolutePath()).toString();
     }
 }

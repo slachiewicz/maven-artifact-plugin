@@ -20,9 +20,12 @@ package org.apache.maven.plugins.artifact.buildinfo;
 
 import java.util.Map;
 
-import org.apache.maven.model.Plugin;
-import org.apache.maven.project.MavenProject;
-import org.codehaus.plexus.util.xml.Xpp3Dom;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.Session;
+import org.apache.maven.api.model.Build;
+import org.apache.maven.api.model.Plugin;
+import org.apache.maven.api.services.ProjectManager;
+import org.apache.maven.api.xml.XmlNode;
 
 /**
  * Plugin utility to detect if install or deploy is skipped in a build, or even nexus-staging.
@@ -33,19 +36,19 @@ class PluginUtil {
     private static final String NEXUS_STAGING = "nexus-staging";
     private static final String CENTRAL_PUBLISHING = "central-publishing";
 
-    static boolean isSkip(MavenProject project) {
+    static boolean isSkip(Session session, Project project) {
         // check the extension plugins first, as using them drops deploy
         if (getPlugin(project, "org.sonatype.plugins:" + NEXUS_STAGING + "-maven-plugin") != null) {
-            return isSkip(project, NEXUS_STAGING);
+            return isSkip(session, project, NEXUS_STAGING);
         }
         if (getPlugin(project, "org.sonatype.central:" + CENTRAL_PUBLISHING + "-maven-plugin") != null) {
-            return isSkip(project, CENTRAL_PUBLISHING);
+            return isSkip(session, project, CENTRAL_PUBLISHING);
         }
         // install/deploy are really used
-        return isSkip(project, "install") || isSkip(project, "deploy");
+        return isSkip(session, project, "install") || isSkip(session, project, "deploy");
     }
 
-    private static boolean isSkip(MavenProject project, String id) {
+    private static boolean isSkip(Session session, Project project, String id) {
         String pluginGa;
         String pluginParameter;
         String pluginProperty;
@@ -66,16 +69,22 @@ class PluginUtil {
         Plugin plugin = getPlugin(project, pluginGa);
         String skip = getPluginParameter(plugin, pluginParameter);
         if (skip == null) {
-            skip = project.getProperties().getProperty(pluginProperty);
+            skip = session.getService(ProjectManager.class)
+                    .getProperties(project)
+                    .get(pluginProperty);
         }
         return Boolean.parseBoolean(skip);
     }
 
-    private static Plugin getPlugin(MavenProject project, String plugin) {
-        Map<String, Plugin> pluginsAsMap = project.getBuild().getPluginsAsMap();
+    private static Plugin getPlugin(Project project, String plugin) {
+        Build build = project.getBuild();
+        if (build == null) {
+            return null;
+        }
+        Map<String, Plugin> pluginsAsMap = build.getPluginsAsMap();
         Plugin result = pluginsAsMap.get(plugin);
-        if (result == null) {
-            pluginsAsMap = project.getPluginManagement().getPluginsAsMap();
+        if (result == null && build.getPluginManagement() != null) {
+            pluginsAsMap = build.getPluginManagement().getPluginsAsMap();
             result = pluginsAsMap.get(plugin);
         }
         return result;
@@ -83,10 +92,10 @@ class PluginUtil {
 
     private static String getPluginParameter(Plugin plugin, String parameter) {
         if (plugin != null) {
-            Xpp3Dom pluginConf = (Xpp3Dom) plugin.getConfiguration();
+            XmlNode pluginConf = plugin.getConfiguration();
 
             if (pluginConf != null) {
-                Xpp3Dom target = pluginConf.getChild(parameter);
+                XmlNode target = pluginConf.getChild(parameter);
 
                 if (target != null) {
                     return target.getValue();

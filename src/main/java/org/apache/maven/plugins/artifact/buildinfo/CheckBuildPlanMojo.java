@@ -18,46 +18,49 @@
  */
 package org.apache.maven.plugins.artifact.buildinfo;
 
-import javax.inject.Inject;
-
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import org.apache.maven.execution.MavenSession;
-import org.apache.maven.lifecycle.LifecycleExecutor;
-import org.apache.maven.lifecycle.MavenExecutionPlan;
-import org.apache.maven.model.Plugin;
-import org.apache.maven.plugin.AbstractMojo;
-import org.apache.maven.plugin.MojoExecution;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.plugins.annotations.Parameter;
-import org.apache.maven.project.MavenProject;
-import org.eclipse.aether.graph.DependencyNode;
-import org.eclipse.aether.util.version.GenericVersionScheme;
-import org.eclipse.aether.version.InvalidVersionSpecificationException;
-import org.eclipse.aether.version.Version;
-import org.eclipse.aether.version.VersionScheme;
+import org.apache.maven.api.Lifecycle;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.Session;
+import org.apache.maven.api.Version;
+import org.apache.maven.api.di.Inject;
+import org.apache.maven.api.model.Build;
+import org.apache.maven.api.model.Plugin;
+import org.apache.maven.api.model.PluginExecution;
+import org.apache.maven.api.plugin.Log;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
+import org.apache.maven.api.plugin.annotations.Parameter;
+import org.apache.maven.api.services.LifecycleRegistry;
+import org.apache.maven.plugins.artifact.buildinfo.RangesUtil.RangeDependency;
 
 /**
  * Check from buildplan that plugins used don't have known Reproducible Builds issues.
  *
  * @since 3.3.0
  */
-@Mojo(name = "check-buildplan", threadSafe = true, requiresProject = true)
-public class CheckBuildPlanMojo extends AbstractMojo {
-    private final MavenProject project;
+@Mojo(name = "check-buildplan")
+public class CheckBuildPlanMojo implements org.apache.maven.api.plugin.Mojo {
+    @Inject
+    private Project project;
 
-    private final MavenSession session;
+    @Inject
+    private Session session;
 
-    private final LifecycleExecutor lifecycleExecutor;
+    @Inject
+    private Log log;
 
     /** Allow to specify which goals/phases will be used to calculate execution plan. */
     @Parameter(property = "check.buildplan.tasks", defaultValue = "deploy")
@@ -83,7 +86,7 @@ public class CheckBuildPlanMojo extends AbstractMojo {
      * Provide a plugin issues property file to override plugin's <code>not-reproducible-plugins.properties</code>.
      */
     @Parameter(property = "check.plugin-issues")
-    private File pluginIssues;
+    private Path pluginIssues;
 
     /**
      * Make build fail if execution plan contains non-reproducible plugins.
@@ -91,128 +94,153 @@ public class CheckBuildPlanMojo extends AbstractMojo {
     @Parameter(property = "check.failOnNonReproducible", defaultValue = "true")
     private boolean failOnNonReproducible;
 
-    private final VersionScheme versionScheme = new GenericVersionScheme();
+    /**
+     * Calculates the plugins of the execution plan.
+     * <p>
+     * The Maven 4 API has no equivalent of the execution plan that a <code>LifecycleExecutor</code> calculates for
+     * tasks: the plan is taken from the effective POM, which has the plugins that the packaging binds to the
+     * lifecycle along with the ones of the POM, with the executions that run in a phase of the lifecycles of the
+     * tasks. An execution without phase is always in the plan, because the default phase of its goals is in the
+     * plugin descriptor, and goals given as tasks are not in the plan.
+     *
+     * @return the plugins of the plan, each once
+     */
+    protected Map<String, Plugin> calculatePlugins() throws MojoException {
+        LifecycleRegistry lifecycleRegistry = session.getService(LifecycleRegistry.class);
 
-    private final RangesUtil rangesUtil;
-
-    @Inject
-    public CheckBuildPlanMojo(
-            MavenProject project, MavenSession session, LifecycleExecutor lifecycleExecutor, RangesUtil rangesUtil) {
-        this.project = project;
-        this.session = session;
-        this.lifecycleExecutor = lifecycleExecutor;
-        this.rangesUtil = rangesUtil;
-    }
-
-    protected MavenExecutionPlan calculateExecutionPlan() throws MojoExecutionException {
-        try {
-            return lifecycleExecutor.calculateExecutionPlan(session, tasks);
-        } catch (Exception e) {
-            throw new MojoExecutionException("Cannot calculate Maven execution plan" + e.getMessage(), e);
+        // the phases up to the phase of each task, in each lifecycle
+        Set<String> phases = new HashSet<>();
+        for (String task : tasks) {
+            boolean found = false;
+            for (Lifecycle lifecycle : lifecycleRegistry) {
+                List<String> lifecyclePhases = lifecycleRegistry.computePhases(lifecycle);
+                int index = lifecyclePhases.indexOf(task);
+                if (index >= 0) {
+                    List<String> upToTask = lifecyclePhases.subList(0, index + 1);
+                    phases.addAll(upToTask);
+                    // the executions may name the phases the Maven 3 way, like process-resources
+                    for (Lifecycle.Alias alias : lifecycle.aliases()) {
+                        if (upToTask.contains(alias.v4Phase())) {
+                            phases.add(alias.v3Phase());
+                        }
+                    }
+                    found = true;
+                }
+            }
+            if (!found && !task.contains(":")) {
+                throw new MojoException("Cannot calculate Maven execution plan: unknown phase " + task);
+            }
         }
+
+        Map<String, Plugin> plugins = new LinkedHashMap<>();
+        Build build = project.getModel().getBuild();
+        if (build != null) {
+            for (Plugin plugin : build.getPlugins()) {
+                boolean inPlan = false;
+                for (PluginExecution execution : plugin.getExecutions()) {
+                    if (execution.getGoals().isEmpty()) {
+                        continue;
+                    }
+                    if (execution.getPhase() == null || phases.contains(execution.getPhase())) {
+                        inPlan = true;
+                    }
+                }
+                if (inPlan) {
+                    plugins.putIfAbsent(plugin.getId(), plugin);
+                }
+            }
+        }
+        return plugins;
     }
 
     @Override
-    public void execute() throws MojoExecutionException {
-        boolean fail =
-                AbstractBuildinfoMojo.hasBadOutputTimestamp(outputTimestamp, getLog(), project, session, diagnose);
+    public void execute() throws MojoException {
+        boolean fail = AbstractBuildinfoMojo.hasBadOutputTimestamp(outputTimestamp, log, project, session, diagnose);
 
         // TODO check maven-jar-plugin module-info.class?
 
         Properties issues = loadIssues();
 
-        MavenExecutionPlan plan = calculateExecutionPlan();
+        Map<String, Plugin> plan = calculatePlugins();
 
-        Set<String> plugins = new HashSet<>();
         int okCount = 0;
-        for (MojoExecution exec : plan.getMojoExecutions()) {
-            Plugin plugin = exec.getPlugin();
+        for (Plugin plugin : plan.values()) {
             String id = plugin.getId();
 
-            if (plugins.add(id)) {
-                // check reproducibility status
-                String issue = issues.getProperty(plugin.getKey());
-                if (issue == null) {
-                    okCount++;
-                    getLog().debug("No known issue with " + id);
-                } else if (issue.startsWith("fail:")) {
-                    String logMessage = "plugin without solution " + id + ", see " + issue.substring(5);
+            // check reproducibility status
+            String issue = issues.getProperty(plugin.getKey());
+            if (issue == null) {
+                okCount++;
+                log.debug("No known issue with " + id);
+            } else if (issue.startsWith("fail:")) {
+                String logMessage = "plugin without solution " + id + ", see " + issue.substring(5);
+                if (failOnNonReproducible) {
+                    log.error(logMessage);
+                } else {
+                    log.warn(logMessage);
+                }
+                fail = true;
+            } else {
+                Version minimum = session.parseVersion(issue);
+                Version version = session.parseVersion(plugin.getVersion());
+                if (version.compareTo(minimum) < 0) {
+                    String logMessage = "plugin with non-reproducible output: " + id + ", require minimum " + issue;
                     if (failOnNonReproducible) {
-                        getLog().error(logMessage);
+                        log.error(logMessage);
                     } else {
-                        getLog().warn(logMessage);
+                        log.warn(logMessage);
                     }
                     fail = true;
                 } else {
-                    try {
-                        Version minimum = versionScheme.parseVersion(issue);
-                        Version version = versionScheme.parseVersion(plugin.getVersion());
-                        if (version.compareTo(minimum) < 0) {
-                            String logMessage =
-                                    "plugin with non-reproducible output: " + id + ", require minimum " + issue;
-                            if (failOnNonReproducible) {
-                                getLog().error(logMessage);
-                            } else {
-                                getLog().warn(logMessage);
-                            }
-                            fail = true;
-                        } else {
-                            okCount++;
-                            getLog().debug("No known issue with " + id + " (>= " + issue + ")");
-                        }
-                    } catch (InvalidVersionSpecificationException e) {
-                        throw new MojoExecutionException(e);
-                    }
+                    okCount++;
+                    log.debug("No known issue with " + id + " (>= " + issue + ")");
                 }
             }
         }
         if (okCount > 0) {
-            getLog().info("No known issue in " + okCount + " plugins");
+            log.info("No known issue in " + okCount + " plugins");
         }
 
         fail = checkVersionRangeInDependencies();
 
         if (fail) {
-            getLog().info("current module pom.xml is " + project.getBasedir() + "/pom.xml");
-            MavenProject parent = project;
-            while (true) {
-                parent = parent.getParent();
-                if ((parent == null) || !session.getProjects().contains(parent)) {
-                    break;
-                }
-                getLog().info("        parent pom.xml is " + parent.getBasedir() + "/pom.xml");
+            log.info("current module pom.xml is " + project.getBasedir() + "/pom.xml");
+            Optional<Project> parent = project.getParent();
+            while (parent.isPresent() && AbstractBuildinfoMojo.isInReactor(session, parent.get())) {
+                log.info("        parent pom.xml is " + parent.get().getBasedir() + "/pom.xml");
+                parent = parent.get().getParent();
             }
             String message = "non-reproducible plugin or configuration found with fix available";
             if (failOnNonReproducible) {
-                throw new MojoExecutionException(message);
+                throw new MojoException(message);
             } else {
-                getLog().warn(message);
+                log.warn(message);
             }
         }
     }
 
-    private boolean checkVersionRangeInDependencies() throws MojoExecutionException {
-        Map<DependencyNode, String> versionRangeDependencies =
-                rangesUtil.findVersionRangeDependencies(session, project);
+    private boolean checkVersionRangeInDependencies() throws MojoException {
+        List<RangeDependency> versionRangeDependencies = RangesUtil.findVersionRangeDependencies(session, project);
         if (!versionRangeDependencies.isEmpty()) {
             String message =
                     "Version specification with a range found in dependencies may make the project build non-reproducible"
-                            + versionRangeDependencies.values().stream()
+                            + versionRangeDependencies.stream()
+                                    .map(RangeDependency::message)
                                     .collect(Collectors.joining(
                                             System.lineSeparator() + " - ", System.lineSeparator() + " - ", ""));
             if (failOnNonReproducible) {
-                getLog().error(message);
+                log.error(message);
             } else {
-                getLog().warn(message);
+                log.warn(message);
             }
         }
         return !versionRangeDependencies.isEmpty();
     }
 
-    private Properties loadIssues() throws MojoExecutionException {
+    private Properties loadIssues() throws MojoException {
         try (InputStream in = (pluginIssues == null)
                 ? getClass().getResourceAsStream("not-reproducible-plugins.properties")
-                : Files.newInputStream(pluginIssues.toPath())) {
+                : Files.newInputStream(pluginIssues)) {
             Properties prop = new Properties();
             prop.load(in);
 
@@ -226,7 +254,7 @@ public class CheckBuildPlanMojo extends AbstractMojo {
             }
             return result;
         } catch (IOException ioe) {
-            throw new MojoExecutionException("Cannot load issues file", ioe);
+            throw new MojoException("Cannot load issues file", ioe);
         }
     }
 }

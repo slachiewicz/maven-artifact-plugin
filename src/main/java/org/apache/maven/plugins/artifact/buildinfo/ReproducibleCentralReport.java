@@ -24,12 +24,12 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 
-import org.apache.maven.artifact.Artifact;
+import org.apache.maven.api.Dependency;
+import org.apache.maven.api.Node;
+import org.apache.maven.api.PathScope;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.plugin.annotations.Mojo;
 import org.apache.maven.doxia.sink.Sink;
-import org.apache.maven.plugins.annotations.LifecyclePhase;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.plugins.annotations.ResolutionScope;
-import org.apache.maven.project.MavenProject;
 import org.apache.maven.reporting.AbstractMavenReport;
 import org.apache.maven.reporting.MavenReportException;
 
@@ -43,12 +43,7 @@ import org.apache.maven.reporting.MavenReportException;
  * from project-level rebuild results.
  * @since 3.6.0
  */
-@Mojo(
-        name = "reproducible-central",
-        defaultPhase = LifecyclePhase.SITE,
-        requiresDependencyResolution = ResolutionScope.RUNTIME,
-        requiresProject = true,
-        threadSafe = true)
+@Mojo(name = "reproducible-central", defaultPhase = "site")
 public class ReproducibleCentralReport extends AbstractMavenReport {
     @Override
     protected void executeReport(Locale locale) throws MavenReportException {
@@ -77,12 +72,19 @@ public class ReproducibleCentralReport extends AbstractMavenReport {
 
         // Group dependencies by scope to help prioritization (compile first, then provided, runtime, test, system,
         // import)
-        Map<String, List<Artifact>> byScope = new TreeMap<>();
-        project.getArtifacts().forEach(a -> {
-            String sc = a.getScope();
-            if (sc == null) {
-                sc = "compile"; // treat null as compile (Maven default)
+        Map<String, List<Dependency>> byScope = new TreeMap<>();
+        Node root;
+        try {
+            root = session.collectDependencies(project, PathScope.MAIN_RUNTIME);
+        } catch (RuntimeException e) {
+            throw new MavenReportException("Cannot collect the dependencies of " + project.getId(), e);
+        }
+        session.flattenDependencies(root, PathScope.MAIN_RUNTIME).forEach(node -> {
+            Dependency a = node.getDependency();
+            if (a == null) {
+                return;
             }
+            String sc = a.getScope().id();
             byScope.computeIfAbsent(sc, k -> new ArrayList<>()).add(a);
         });
 
@@ -91,7 +93,7 @@ public class ReproducibleCentralReport extends AbstractMavenReport {
 
         // Render groups in order; any other scopes (or missing) will be rendered afterwards sorted by name
         for (String scope : orderedScopes) {
-            List<Artifact> list = byScope.remove(scope);
+            List<Dependency> list = byScope.remove(scope);
             if (list != null && !list.isEmpty()) {
                 sink.sectionTitle2();
                 sink.text(scope + " dependencies:");
@@ -156,13 +158,18 @@ public class ReproducibleCentralReport extends AbstractMavenReport {
         sink.body_();
     }
 
-    private void renderReproducibleCentralArtifact(Sink sink, MavenProject project) {
+    private void renderReproducibleCentralArtifact(Sink sink, Project project) {
         renderReproducibleCentralArtifact(
                 sink, project.getGroupId(), project.getArtifactId(), project.getVersion(), null);
     }
 
-    private void renderReproducibleCentralArtifact(Sink sink, Artifact a) {
-        renderReproducibleCentralArtifact(sink, a.getGroupId(), a.getArtifactId(), a.getVersion(), a.getScope());
+    private void renderReproducibleCentralArtifact(Sink sink, Dependency a) {
+        renderReproducibleCentralArtifact(
+                sink,
+                a.getGroupId(),
+                a.getArtifactId(),
+                a.getVersion().toString(),
+                a.getScope().id());
     }
 
     private void renderReproducibleCentralArtifact(
