@@ -19,14 +19,12 @@
 package org.apache.maven.plugins.artifact.buildinfo;
 
 import java.io.IOException;
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
-import org.apache.maven.toolchain.Toolchain;
-import org.codehaus.plexus.util.cli.CommandLineException;
-import org.codehaus.plexus.util.cli.CommandLineUtils;
-import org.codehaus.plexus.util.cli.Commandline;
-import org.codehaus.plexus.util.cli.StreamConsumer;
+import org.apache.maven.api.Toolchain;
 
 /**
  * A helper to get JDK version from a JDK toolchain.
@@ -37,31 +35,30 @@ class JdkToolchainUtil {
         String java = toolchain.findTool("java");
         if (java != null) {
             try {
-                Commandline cl = new Commandline(java + " -version");
-                LineConsumer out = new LineConsumer();
-                LineConsumer err = new LineConsumer();
-                CommandLineUtils.executeCommandLine(cl, out, err);
-                version = String.join(":", err.getLines());
-                if (version == null || version.trim().isEmpty()) {
+                Process process = new ProcessBuilder(java, "-version")
+                        .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                        .start();
+                // "java -version" prints to the error stream
+                List<String> lines = new ArrayList<>();
+                try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(process.getErrorStream(), Charset.defaultCharset()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        lines.add(line);
+                    }
+                }
+                process.waitFor(1, TimeUnit.MINUTES);
+                version = String.join(":", lines);
+                if (version.trim().isEmpty()) {
                     version = "unable to detect...";
                 }
-            } catch (CommandLineException cle) {
-                version = cle.toString();
+            } catch (IOException e) {
+                version = e.toString();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                version = e.toString();
             }
         }
         return version;
-    }
-
-    private static class LineConsumer implements StreamConsumer {
-        private final List<String> lines = new ArrayList<>();
-
-        @Override
-        public void consumeLine(String line) throws IOException {
-            lines.add(line);
-        }
-
-        List<String> getLines() {
-            return lines;
-        }
     }
 }

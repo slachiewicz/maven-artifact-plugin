@@ -18,20 +18,11 @@
  */
 package org.apache.maven.plugins.artifact.buildinfo;
 
-import javax.inject.Inject;
-
 import java.util.Map;
 
-import org.apache.maven.execution.MavenSession;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.plugins.annotations.LifecyclePhase;
-import org.apache.maven.plugins.annotations.Mojo;
-import org.apache.maven.plugins.annotations.Parameter;
-import org.apache.maven.project.MavenProject;
-import org.apache.maven.project.MavenProjectHelper;
-import org.apache.maven.rtinfo.RuntimeInformation;
-import org.apache.maven.toolchain.ToolchainManager;
-import org.eclipse.aether.artifact.Artifact;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.plugin.annotations.Mojo;
+import org.apache.maven.api.plugin.annotations.Parameter;
 
 /**
  * Creates a buildinfo file recording build environment and output (from {@code package}), as specified in
@@ -39,7 +30,7 @@ import org.eclipse.aether.artifact.Artifact;
  * for mono-module build, and extended for multi-module build.
  * @deprecated buildinfo is an internal format, prefer the {@code describe-build-output} or {@code compare} goals
  */
-@Mojo(name = "buildinfo", defaultPhase = LifecyclePhase.VERIFY, threadSafe = false)
+@Mojo(name = "buildinfo", defaultPhase = "verify")
 @Deprecated
 public class BuildinfoMojo extends AbstractBuildinfoMojo {
     /**
@@ -48,25 +39,8 @@ public class BuildinfoMojo extends AbstractBuildinfoMojo {
     @Parameter(property = "buildinfo.attach", defaultValue = "true")
     private boolean attach;
 
-    /**
-     * Used for attaching the buildinfo file in the project.
-     */
-    private final MavenProjectHelper projectHelper;
-
-    @Inject
-    public BuildinfoMojo(
-            ToolchainManager toolchainManager,
-            RuntimeInformation runtimeInformation,
-            RangesUtil rangesUtil,
-            MavenProject project,
-            MavenSession session,
-            MavenProjectHelper projectHelper) {
-        super(toolchainManager, runtimeInformation, rangesUtil, project, session);
-        this.projectHelper = projectHelper;
-    }
-
     @Override
-    public void execute(Map<Artifact, String> artifacts) throws MojoExecutionException {
+    public void execute(Map<OutputArtifact, String> artifacts) throws MojoException {
         // attach / deploy feature has been removed, see #216
     }
 }

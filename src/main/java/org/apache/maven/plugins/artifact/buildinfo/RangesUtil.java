@@ -18,130 +18,194 @@
  */
 package org.apache.maven.plugins.artifact.buildinfo;
 
-import javax.inject.Inject;
-import javax.inject.Named;
-
-import java.util.LinkedHashMap;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
 
-import org.apache.maven.RepositoryUtils;
-import org.apache.maven.execution.MavenSession;
-import org.apache.maven.model.DependencyManagement;
-import org.apache.maven.plugin.MojoExecutionException;
-import org.apache.maven.project.MavenProject;
-import org.eclipse.aether.RepositorySystem;
-import org.eclipse.aether.artifact.ArtifactTypeRegistry;
-import org.eclipse.aether.collection.CollectRequest;
-import org.eclipse.aether.collection.DependencyCollectionException;
-import org.eclipse.aether.graph.Dependency;
-import org.eclipse.aether.graph.DependencyNode;
-import org.eclipse.aether.util.graph.visitor.PathRecordingDependencyVisitor;
-import org.eclipse.aether.version.VersionConstraint;
-
-import static java.util.Optional.ofNullable;
+import org.apache.maven.api.ArtifactCoordinates;
+import org.apache.maven.api.Dependency;
+import org.apache.maven.api.DependencyCoordinates;
+import org.apache.maven.api.Node;
+import org.apache.maven.api.PathScope;
+import org.apache.maven.api.Project;
+import org.apache.maven.api.Session;
+import org.apache.maven.api.VersionConstraint;
+import org.apache.maven.api.VersionRange;
+import org.apache.maven.api.plugin.MojoException;
+import org.apache.maven.api.services.ProjectBuilder;
+import org.apache.maven.api.services.ProjectBuilderRequest;
 
 /**
  * Utility class to find dependencies with version ranges in the project.
+ * <p>
+ * The Maven 4 API does not keep the version constraint of a dependency in the dependency graph: the ranges of the
+ * project are read from its dependencies, and the ones of the transitive dependencies from the POM of each
+ * dependency of the graph.
  */
-@Named
 public class RangesUtil {
 
-    private final RepositorySystem repoSystem;
+    /**
+     * A dependency that has been resolved from a version range.
+     *
+     * @param groupId the groupId of the resolved dependency
+     * @param artifactId the artifactId of the resolved dependency
+     * @param version the version the range has been resolved to
+     * @param message the description of the dependency and of its range
+     */
+    public record RangeDependency(String groupId, String artifactId, String version, String message) {}
 
-    @Inject
-    RangesUtil(RepositorySystem repoSystem) {
-        this.repoSystem = repoSystem;
-    }
+    private RangesUtil() {}
 
     /**
      * Finds all dependencies with version ranges in the project.
      *
      * @param session the Maven session
      * @param project the Maven project to analyze
-     * @return a map of dependency nodes with version ranges to their issue descriptions
-     * @throws MojoExecutionException if dependency collection fails
+     * @return the dependencies resolved from a version range
+     * @throws MojoException if dependency collection fails
      */
-    public Map<DependencyNode, String> findVersionRangeDependencies(MavenSession session, MavenProject project)
-            throws MojoExecutionException {
-        DependencyNode rootNode = collectDependencies(session, project);
-        return collectVersionRangeDependencies(rootNode);
-    }
-
-    private DependencyNode collectDependencies(MavenSession session, MavenProject project)
-            throws MojoExecutionException {
-        ArtifactTypeRegistry artifactTypeRegistry =
-                session.getRepositorySession().getArtifactTypeRegistry();
-
-        List<Dependency> dependencies = project.getDependencies().stream()
-                .map(d -> RepositoryUtils.toDependency(d, artifactTypeRegistry))
-                .collect(Collectors.toList());
-
-        List<Dependency> managedDependencies = ofNullable(project.getDependencyManagement())
-                .map(DependencyManagement::getDependencies)
-                .map(list -> list.stream()
-                        .map(d -> RepositoryUtils.toDependency(d, artifactTypeRegistry))
-                        .collect(Collectors.toList()))
-                .orElse(null);
-
-        CollectRequest collectRequest =
-                new CollectRequest(dependencies, managedDependencies, project.getRemoteProjectRepositories());
-        collectRequest.setRootArtifact(RepositoryUtils.toArtifact(project.getArtifact()));
-
+    public static List<RangeDependency> findVersionRangeDependencies(Session session, Project project)
+            throws MojoException {
+        Node root;
         try {
-            return repoSystem
-                    .collectDependencies(session.getRepositorySession(), collectRequest)
-                    .getRoot();
-        } catch (DependencyCollectionException e) {
-            throw new MojoExecutionException("Cannot build dependency tree: " + e.getMessage(), e);
+            root = session.collectDependencies(project, PathScope.TEST_RUNTIME);
+        } catch (RuntimeException e) {
+            throw new MojoException("Cannot build dependency tree: " + e.getMessage(), e);
         }
-    }
-
-    private Map<DependencyNode, String> collectVersionRangeDependencies(DependencyNode rootNode) {
-        Map<DependencyNode, String> result = new LinkedHashMap<>();
-
-        rootNode.accept(new PathRecordingDependencyVisitor((node, parents) -> {
-            VersionConstraint versionConstraint = node.getVersionConstraint();
-            if (isVersionRange(versionConstraint)) {
-                String path = "";
-                if (parents.size() > 1) {
-                    path = " via "
-                            + parents.stream()
-                                    .limit(parents.size() - 1)
-                                    .map(n -> n.getDependency().getArtifact().toString())
-                                    .collect(Collectors.joining(" --> "));
-                }
-                result.put(
-                        node,
-                        "Dependency " + node.getDependency() + path + " has been resolved from a version range "
-                                + versionConstraint);
-            }
-
-            // track all dependencies
-            return false;
-        }));
-
+        List<RangeDependency> result = new ArrayList<>();
+        walk(
+                session,
+                root,
+                project.getDependencies(),
+                project.getManagedDependencies(),
+                new LinkedList<>(),
+                new HashMap<>(),
+                result);
         return result;
     }
 
-    private boolean isVersionRange(VersionConstraint versionConstraint) {
+    private static void walk(
+            Session session,
+            Node parent,
+            List<DependencyCoordinates> declared,
+            List<DependencyCoordinates> managed,
+            LinkedList<Node> ancestors,
+            Map<String, List<DependencyCoordinates>> cache,
+            List<RangeDependency> result) {
+        for (Node child : parent.getChildren()) {
+            Dependency dependency = child.getDependency();
+            if (dependency == null) {
+                continue;
+            }
+            // the dependency management of the project applies to every dependency, it replaces the version a
+            // POM declares, range or not
+            DependencyCoordinates coordinates = find(managed, dependency);
+            if (coordinates == null) {
+                coordinates = find(declared, dependency);
+            }
+            if (coordinates != null && isVersionRange(coordinates.getVersionConstraint())) {
+                String path = "";
+                if (!ancestors.isEmpty()) {
+                    // from the direct parent, up to the child of the project
+                    path = " via "
+                            + ancestors.stream()
+                                    .map(n -> describe(n.getDependency(), false))
+                                    .collect(Collectors.joining(" --> "));
+                }
+                result.add(new RangeDependency(
+                        dependency.getGroupId(),
+                        dependency.getArtifactId(),
+                        dependency.getVersion().toString(),
+                        "Dependency " + describe(dependency, true) + path + " has been resolved from a version range "
+                                + coordinates.getVersionConstraint()));
+            }
+
+            if (!child.getChildren().isEmpty()) {
+                ancestors.addFirst(child);
+                walk(session, child, dependenciesOf(session, dependency, cache), managed, ancestors, cache, result);
+                ancestors.removeFirst();
+            }
+        }
+    }
+
+    private static String describe(Dependency dependency, boolean withScope) {
+        String artifact = dependency.getGroupId()
+                + ':'
+                + dependency.getArtifactId()
+                + ':'
+                + dependency.getExtension()
+                + (dependency.getClassifier().isEmpty() ? "" : ":" + dependency.getClassifier())
+                + ':'
+                + dependency.getVersion();
+        return withScope
+                ? artifact + " (" + dependency.getScope().id() + (dependency.isOptional() ? "?" : "") + ")"
+                : artifact;
+    }
+
+    private static DependencyCoordinates find(List<DependencyCoordinates> declared, Dependency dependency) {
+        for (DependencyCoordinates candidate : declared) {
+            if (candidate.getGroupId().equals(dependency.getGroupId())
+                    && candidate.getArtifactId().equals(dependency.getArtifactId())) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @return the dependencies the POM of a dependency declares, or an empty list if the POM cannot be read
+     */
+    private static List<DependencyCoordinates> dependenciesOf(
+            Session session, Dependency dependency, Map<String, List<DependencyCoordinates>> cache) {
+        String key = dependency.getGroupId() + ':' + dependency.getArtifactId() + ':' + dependency.getVersion();
+        return cache.computeIfAbsent(key, k -> {
+            try {
+                ArtifactCoordinates pom = session.createArtifactCoordinates(
+                        dependency.getGroupId(),
+                        dependency.getArtifactId(),
+                        dependency.getVersion().toString(),
+                        "pom");
+                Path pomPath = session.resolveArtifact(pom).getPath();
+                return session.getService(ProjectBuilder.class)
+                        .build(ProjectBuilderRequest.builder()
+                                .session(session)
+                                .path(pomPath)
+                                .processPlugins(false)
+                                .build())
+                        .getProject()
+                        .map(Project::getDependencies)
+                        .orElse(List.of());
+            } catch (RuntimeException e) {
+                return List.of();
+            }
+        });
+    }
+
+    private static boolean isVersionRange(VersionConstraint versionConstraint) {
         if (versionConstraint == null) {
             return false;
         }
 
-        if (versionConstraint.getVersion() != null) {
-            String version = versionConstraint.getVersion().toString();
+        if (versionConstraint.getRecommendedVersion() != null) {
+            String version = versionConstraint.getRecommendedVersion().toString();
             return version.equals("LATEST") || version.equals("RELEASE");
         }
 
-        if (versionConstraint.getRange() != null) {
-            return versionConstraint.getRange().getLowerBound() == null
-                    || versionConstraint.getRange().getUpperBound() == null
-                    || !Objects.equals(
-                            versionConstraint.getRange().getLowerBound(),
-                            versionConstraint.getRange().getUpperBound());
+        VersionRange range = versionConstraint.getVersionRange();
+        if (range != null) {
+            Object lower = range.getLowerBoundary() == null
+                    ? null
+                    : range.getLowerBoundary().getVersion();
+            Object upper = range.getUpperBoundary() == null
+                    ? null
+                    : range.getUpperBoundary().getVersion();
+            // a range without lower or upper bound is open, so the resolved version changes over time
+            return lower == null || upper == null || !Objects.equals(lower, upper);
         }
         return false;
     }
